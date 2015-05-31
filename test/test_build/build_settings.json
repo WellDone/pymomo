@@ -4,7 +4,8 @@
 		"default_settings" :
 		{
 			"executive_rom": [0, 959],
-			"executive_ram": [[32, 120]],
+			"executive_ram": [ [32, 120] ],
+			"application_ram": [ [121,127], [160, 191] ],
 			"total_rom": 2048,
 			"flash_row_words": 16,
 
@@ -81,13 +82,13 @@
 
 			"exec":
 			{
-				"extra_xc8_flags": ["--runtime=default,+clear,+keep,+init,-no_startup,-osccal,-resetbits,-download,-stackcall"],
+				"extra_xc8_flags": ["--runtime=default,+clear,+keep,+init,-no_startup,-osccal,-resetbits,-download,-stackcall,-clib"],
 				"is_exec": true
 			},
 
 			"app":
 			{
-				"extra_xc8_flags": ["--runtime=+init,-no_startup,-osccal,+clear,+clib,-plib,+download"],
+				"extra_xc8_flags": ["--runtime=-init,+no_startup,-osccal,-clear,+clib,-plib,+download"],
 				"is_exec": false
 			}
 		},
@@ -179,10 +180,8 @@
 					"__PIC24F16KA101__": 1,
 					"__NO_PERF__": 1,
 					"__NO_FLASH__": 1,
-					"kI2CBaud": 157,
-					"kClockspeed": "16000000L",
-					"SDA": "B9", 
-					"SCL": "B8"
+					"kI2CBaud": 39,
+					"kClockspeed": "4000000L" 
 				},
 
 				"chip": "24f16ka101"
@@ -194,9 +193,7 @@
 				{
 					"__PIC24FJ64GA306__": 1,
 					"kI2CBaud": 39,
-					"kClockspeed": "4000000L",
-					"SDA": "G3", 
-					"SCL": "G2"
+					"kClockspeed": "4000000L"
 				},
 
 				"chip": "24fj64ga306"
