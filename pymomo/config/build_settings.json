@@ -4,8 +4,7 @@
 		"default_settings" :
 		{
 			"executive_rom": [0, 959],
-			"application_ram": [ [32, 120] ],
-			"executive_ram": [ [121,127], [160, 191] ],
+			"executive_ram": [[32, 120]],
 			"total_rom": 2048,
 			"flash_row_words": 16,
 
@@ -36,8 +35,11 @@
 				"executive_rom": [0, 1119],
 				"flash_row_words": 32,
 				"total_rom": 8192,
+				"total_ram": 1024,
 				"xc8_target": "16F1847",
 				"gpsim_proc": "p16f1847",
+				"gpsim_sda": "portb1",
+				"gpsim_scl": "portb4",
 
 				"defines":
 				{
@@ -51,6 +53,9 @@
 			{
 				"xc8_target": "16F1823",
 				"gpsim_proc": "p16f1823",
+				"gpsim_sda": "portc1",
+				"gpsim_scl": "portc0",
+				"total_ram": 128,
 
 				"defines":
 				{
@@ -63,6 +68,9 @@
 			{
 				"xc8_target": "12F1822",
 				"gpsim_proc": "p12f1822",
+				"gpsim_sda": "porta2",
+				"gpsim_scl": "porta1",
+				"total_ram": 128,
 
 				"defines":
 				{
@@ -73,13 +81,13 @@
 
 			"exec":
 			{
-				"extra_xc8_flags": ["--runtime=default,+clear,+keep,+init,-no_startup,-osccal,-resetbits,-download,-stackcall,-clib"],
+				"extra_xc8_flags": ["--runtime=default,+clear,+keep,+init,-no_startup,-osccal,-resetbits,-download,-stackcall"],
 				"is_exec": true
 			},
 
 			"app":
 			{
-				"extra_xc8_flags": ["--runtime=-init,+no_startup,-osccal,-clear,+clib,-plib,+download"],
+				"extra_xc8_flags": ["--runtime=+init,-no_startup,-osccal,+clear,+clib,-plib,+download"],
 				"is_exec": false
 			}
 		},
@@ -171,8 +179,10 @@
 					"__PIC24F16KA101__": 1,
 					"__NO_PERF__": 1,
 					"__NO_FLASH__": 1,
-					"kI2CBaud": 39,
-					"kClockspeed": "4000000L" 
+					"kI2CBaud": 157,
+					"kClockspeed": "16000000L",
+					"SDA": "B9", 
+					"SCL": "B8"
 				},
 
 				"chip": "24f16ka101"
@@ -184,7 +194,9 @@
 				{
 					"__PIC24FJ64GA306__": 1,
 					"kI2CBaud": 39,
-					"kClockspeed": "4000000L"
+					"kClockspeed": "4000000L",
+					"SDA": "G3", 
+					"SCL": "G2"
 				},
 
 				"chip": "24fj64ga306"

@@ -1,20 +1,26 @@
-import proxy
-import proxy12
+from pymomo.commander.proxy import proxy
+from pymomo.commander.proxy import proxy12
+import pymomo.commander.proxy
 from pymomo.commander.exceptions import *
 from pymomo.commander.types import *
-from pymomo.commander.cmdstream import *
 from pymomo.utilities.console import ProgressBar
 import struct
 from pymomo.utilities.intelhex import IntelHex
 from time import sleep
 from datetime import datetime
 from pymomo.syslog import RawLogEntry, SystemLog
-from pymomo.utilities.typedargs.annotate import annotated,param,returns, context
+from pymomo.utilities.typedargs.annotate import annotated,param,returns, context, return_type
 from pymomo.utilities import typedargs
+from pymomo.utilities.typedargs import type_system, iprint
 from pymomo.exceptions import *
+from tempfile import NamedTemporaryFile
+from pymomo.hex16.convert import *
+import pymomo.hex
 import itertools
 import base64
 import uuid
+import os
+import sys
 
 #Formatters for the return types used in this class
 def print_module_list(mods):
@@ -34,8 +40,8 @@ class MIBController (proxy.MIBProxyObject):
 	MaxModuleFirmwares = 4
 
 	@annotated
-	def __init__(self, stream):
-		super(MIBController, self).__init__(stream, 8)
+	def __init__(self, stream, address=8):
+		super(MIBController, self).__init__(stream, address)
 		self.name = 'Controller'
 
 	@returns(desc='number of attached module', data=True)
@@ -47,12 +53,11 @@ class MIBController (proxy.MIBProxyObject):
 		res = self.rpc(42, 1, result_type=(1, False))
 		return res['ints'][0]
 
-	def reflash(self):
+	def _reflash(self):
 		try:
 			self.rpc(42, 0xA)
-		except RPCException as e:
-			if e.type != 7:
-				raise e
+		except ModuleNotFoundError:
+			pass
 
 	def describe_module(self, index):
 		"""
@@ -79,19 +84,125 @@ class MIBController (proxy.MIBProxyObject):
 
 		log = []
 
+		pb = ProgressBar("Downloading %d log entries" % count, count)
+
+		pb.start()
 		for i in xrange(0, count):
 			res = self.rpc(42, 0x22, i, 0, result_type=(0, True))
 			try:
 				log.append(RawLogEntry(res['buffer']))
 			except ValidationError as e:
-				print "FAILED TO PARSE A LOG ENTRY, %d entries discarded" % (count - i)
+				iprint("FAILED TO PARSE A LOG ENTRY, %d entries discarded" % (count - i))
 				break
+
+			pb.progress(i)
+
+		pb.end()
 
 		return SystemLog(log)
 
+	def _convert_hex24(self, hexfile):
+		"""
+		Convert a hex file for the pic24 from 4 bytes per 2 words to 3 bytes per two words
+
+		This is how the file is stored on the MoMo Controller to save space.
+		"""
+
+		tmpf = NamedTemporaryFile(delete=False)
+		tmpf.close()
+
+		tmp = tmpf.name
+
+		out = unpad_pic24_hex(hexfile)
+		out.write_hex_file(tmp)
+		return tmp
+
+	@param("hexfile", "path", "readable", desc="Hex file containing firmware to flash")
+	@param("name", "string", desc="Name of module to reflash")
+	@param("noreset", "bool", desc="Do not reset the bus after reflash is complete")
+	def reflash_module(self, hexfile, name, noreset=False):
+		"""
+		Reflash a mib module given its name.
+		"""
+
+		#Enter safe mode and wait for the modules to all reregister
+		#self.enter_safe_mode()
+		#sleep(2)
+
+		#Make sure the module exists before pushing the firmware
+		mod = self.get_module(name=name, force=False)
+
+		self.clear_firmware_cache()
+		bucket = self.push_firmware(hexfile, 0)
+
+		mod.rpc(0, 5, 8, bucket)
+		mod.reset()
+
+		try:
+			sleep(1.5)
+			if not self.alarm_asserted():
+				iprint("Module reflash NOT DETECTED.  Verify the module checksum to ensure it is programmed correctly.")
+				raise HardwareError("Could not reflash module, reflash not detected using alarm pin.")
+
+			iprint("Reflash in progress")
+
+			while self.alarm_asserted():
+				if type_system.interactive:
+					sys.stdout.write('.')
+					sys.stdout.flush()
+				sleep(0.1)
+		except StreamOperationNotSupportedError:
+			iprint("Waiting 12 seconds for module to reflash itself.")
+			sleep(12.)
+
+		iprint("\nReflash complete.")
+
+		sleep(0.5)
+
+		if not noreset: 
+			iprint("Resetting the bus...")
+
+		self.reset(sync=True)
+
+	@param("hexfile", "path", "readable", desc="new controller hex file")
+	def reflash(self, hexfile):
+		"""
+		Reflash the controller with a new application image.
+
+		Given a path to a hexfile, push it onto the controller and then
+		tell the controller to reflash itself.  This is a synchronous command
+		that will return once the reflash operation is complete and the new code
+		is running on the controller.  Any errors in the process will be raised.
+		"""
+
+		processed = self._convert_hex24(hexfile)
+		self.push_firmware(processed, 5)
+		os.remove(processed)
+		self._reflash()
+
+		try:
+			sleep(0.5)
+			if not self.alarm_asserted():
+				raise HardwareError("Could not reflash controller", reason="Controller reflash NOT DETECTED.  You may need to try the recovery procedure.")
+
+			iprint("Reflash in progress")
+
+			while self.alarm_asserted():
+				if type_system.interactive:
+					sys.stdout.write('.')
+					sys.stdout.flush()
+
+				sleep(0.1)
+		except StreamOperationNotSupportedError:
+			iprint("Waiting 7 seconds for module to reflash itself.")
+			sleep(7.0)
+
+		iprint("\nReflash complete.")
+
 	@param("name", "string", desc="module name")
 	@param("address", "integer", ("range", 11, 127), desc="modules address")
-	def get_module(self, name=None, address=None, force=False):
+	@param("type", "string", desc="type of proxy object to return")
+	def get_module(self, name=None, address=None, force=False, type=None):
 		"""
 		Given a module name or a fixed address, return a proxy object
 		for that module if it is connected to the bus.  If force is True
@@ -105,24 +216,31 @@ class MIBController (proxy.MIBProxyObject):
 			obj.name = 'Unknown'
 			return obj
 
-		mods = self.enumerate_modules()
-		if name is not None and len(name) < 7:
-			name += (' '*(7 - len(name)))
+		mods = self.list_modules()
+		if name is not None and len(name) < 6:
+			name += (' '*(6 - len(name)))
 
 		for mod in mods:
 			if name == mod.name or address == mod.address:
-				obj = proxy12.MIB12ProxyObject(self.stream, mod.address)
+				typeobj = proxy12.MIB12ProxyObject
+				if type is not None:
+					return self.hwmanager._create_proxy(type, mod.address)
+
+				if typeobj is None:
+					raise ArgumentError("Could not find proxy module for specified type", type=type, known_types=self.hwmanager.name_map.keys())
+
+				obj = typeobj(self.stream, mod.address)
 				obj.name = mod.name
 				return obj
 
-		raise ValueError("Could not find module by name or address (name=%s, address=%s)" % (str(name), str(address)))
+		raise ArgumentError("Could not find module by name or address", name=name, address=address, attached_modules=[mod.name for mod in mods])
 
 	@returns(desc='list of attached modules', printer=print_module_list, data=True)
-	def enumerate_modules(self):
+	def list_modules(self):
 		"""
 		Get list of all attached modules and describe them all
 		"""
-		
+
 		num = self.count_modules()
 
 		mods = []
@@ -151,7 +269,8 @@ class MIBController (proxy.MIBProxyObject):
 		"""
 		res = self.rpc(42, 0x0E, int(bool(val)))
 
-	def battery_status(self):
+	@return_type("float")
+	def battery_level(self):
 		res = self.rpc(42, 0x0B, result_type=(1, False))
 		volt_raw = res['ints'][0]
 
@@ -180,6 +299,17 @@ class MIBController (proxy.MIBProxyObject):
 
 		packed = struct.pack('HB%dB' % cnt, addr, rec, *data)
 		return bytearray(packed)
+
+	@param("hexfile", "path", "readable", desc="path of backup firmware image to load")
+	def push_backup(self, hexfile):
+		"""
+		Push a recovery firmware image to the controller
+		"""
+
+		processed = self._convert_hex24(hexfile)
+		iprint("Pushing (processed) backup controller firmware")
+		self.push_firmware(processed, 6, verbose=True)
+		os.remove(processed)
 
 	def push_firmware(self, firmware, module_type, verbose=True):
 		"""
@@ -223,21 +353,28 @@ class MIBController (proxy.MIBProxyObject):
 
 		return bucket
 
-	def pull_firmware(self, bucket, verbose=True, pic12=True):
+	@param("bucket", "integer", ("range", 0, 5), desc="Firmware bucket to pull from [0-5]")
+	@param("save", "path", desc="Output file to save")
+	@param("raw", "bool", desc='Do not process the result in any way')
+	def pull_firmware(self, bucket, save=None, raw=False):
 		res, reason = self._firmware_bucket_loaded(bucket)
 
 		if res == False:
 			raise ValueError(reason)
+
+		if bucket < 4:
+			pic12 = True
+		else:
+			pic12 = False
 
 		info = self.get_firmware_info(bucket)
 		length = info['length']
 
 		out = IntelHex()
 
-		if verbose:
-			print "Getting Firmware, size=0x%X" % length
-			prog = ProgressBar("Transmission Progress", length // 20)
-			prog.start()
+		iprint("Getting Firmware, size=0x%X" % length)
+		prog = ProgressBar("Transmission Progress", length // 20)
+		prog.start()
 
 		for i in xrange(0, length, 20):
 			res = self.rpc(7, 4, bucket, i, result_type=(0, True))
@@ -247,13 +384,30 @@ class MIBController (proxy.MIBProxyObject):
 				if pic12 and (j%2 != 0):
 					out[i+j] &= 0x3F
 
-			if verbose:
-				prog.progress(i//20)
+			prog.progress(i//20)
 
-		if verbose:
-			prog.end()
+		prog.end()
 
-		return out
+		if not pic12 and not raw:
+			out = pad_pic24_hex(out)
+		
+		if save is not None:
+			out.write_hex_file(save)
+			return 
+		
+		tmpf = NamedTemporaryFile(delete=False)
+		tmpf.close()
+		tmp = tmpf.name
+		out.write_hex_file(tmp)
+
+		if pic12:
+			outhex = pymomo.hex.HexFile(tmp, 14, 2, 1)
+		else:	
+			outhex = pymomo.hex.HexFile(tmp, 24, 4, 2)
+
+		os.remove(tmp)
+		return outhex
+
 
 	def _firmware_bucket_loaded(self, index):
 		res = self.get_firmware_count()
@@ -438,47 +592,116 @@ class MIBController (proxy.MIBProxyObject):
 		the alarm is asserted (low value since it's active low).  Returns False otherwise
 		"""
 
-		resp, result = self.stream.send_cmd("alarm status")
-		if result != CMDStream.OkayResult:
-			raise RuntimeError("Alarm status command failed")
-
-		resp = resp.lstrip().rstrip()
-		val = int(resp)
-
-		if val == 0:
-			return True
-		elif val == 1:
-			return False
-		else:
-			raise RuntimeError("Invalid result returned from 'alarm status' command: %s" % resp)
-
+		return self.hwmanager.check_alarm()
 
 	def set_alarm(self, asserted):
 		"""
 		Instruct the field service unit to assert or deassert the alarm line on the MoMo bus.
 		"""
 
-		if asserted:
-			arg = "yes"
-		else:
-			arg = "no"
+		self.hwmanager.set_alarm(asserted)
 
-		cmd = "alarm %s" % arg
+	@param("value", "string", desc='Data to echo')
+	@return_type("string")
+	def echo(self, value):
+		res = self.rpc(42, 0x28, value, result_type=(0,True))
 
-		resp, result = self.stream.send_cmd(cmd)
-		if result != CMDStream.OkayResult:
-			raise RuntimeError("Set alarm command failed")
+		print len(value)
+		print len(res['buffer'])
+		print value
+		print res['buffer']
 
-	@returns(desc='bluetooth receive buffer', data=True)
+	@return_type("map(string, string)")
 	def bt_debug_log(self):
 		"""
 		Return the first 20 bytes of BTLE communication receive buffer.
 		This contains the response to the last command sent to the unit.
 		"""
 
+		out = ""
+		for i in xrange(0, 648, 20):
+			res = self.rpc(42, 0x27, i, result_type=(0,True))
+			out += res['buffer']
 
-		res = self.rpc(42, 0x27, result_type=(0,True))
-		return str(res['buffer'])
+		fmt = "<H"
+
+		flags, = struct.unpack_from(fmt, out)
+		i = 2
+		send = out[i:i+100]
+		i += 100
+
+		receive = out[i:i+256]
+		i += 256
+
+		cmd = out[i:i+26]
+		i += 26
+
+		transmitted_cursor, = struct.unpack_from(fmt, out[i:i+2])
+		i+=2
+
+		send_cursor, = struct.unpack_from(fmt, out[i:i+2])
+		i+=2
+
+		receive_cursor, = struct.unpack_from(fmt, out[i:i+2])
+		i+=2
+
+		checksum_errors, = struct.unpack_from(fmt, out[i:i+2])
+		i+=2
+
+		return {'flags': bin(flags), 'cmd_buffer': repr(cmd), 'checksum_errors': checksum_errors, 'send_buffer': repr(send), 'receive_buffer': repr(receive), 'send_cursor':send_cursor, 'transmitted_cursor': transmitted_cursor}
+
+	@param('element_size', 'integer', 'positive', desc='Size of each flashqueue element [1, 256]')
+	@param('subsections', 'integer', 'positive', desc='Number of subsections to allocate [2, 7]')
+	@param('version', 'integer', 'positive', desc='Version of flashblock to create')
+	def test_fq_init(self, element_size, subsections, version):
+		self.rpc(42, 0x30, version, element_size, subsections)
+
+	@return_type("integer")
+	def test_fq_address(self):
+		res = self.rpc(42, 0x32, result_type=(1, False))
+		return res['ints'][0]
+
+	@param("start", 'integer')
+	@param("count", 'integer')
+	def test_fq_push_n(self, start, count):
+		self.rpc(42, 0x31, count, start, timeout=20.0)
+
+	@return_type("integer")
+	def test_fq_pop(self):
+		res = self.rpc(42, 0x33, result_type=(1, True))
+
+		if res['ints'][0] == 0:
+			return -1
+
+		out = ord(res['buffer'][0]) | (ord(res['buffer'][1]) << 8)
+		return out
+		
+	@return_type("integer")
+	@param("message", "string", desc="Message to send with broadcast packets (<=20 bytes)")
+	def bt_setbroadcast(self, message):
+		"""
+		Set the message sent with broadcast packets for this device.
+
+		The message needs to be <= 20 bytes long.  The call returns a
+		status code from the BTLE module indicating success or failure.
+
+		A return value of 0 is success.
+		"""
+
+		if len(message) > 20:
+			raise ArgumentError("Message too long (limit = 20 bytes)", message=message)
+
+		res = self.rpc(42, 0x28, message, result_type=(1, False))
+
+		return res['ints'][0]
+
+	@param("address", "integer", desc="Address of Comm Module to test")
+	def test_comm_streaming(self, address):
+		"""
+		Stream a test message to the specified comm module
+		"""
+
+		res = self.rpc(60, 0x15, address)
 
 	def momo_attached(self):
 		resp, result = self.stream.send_cmd("attached")
@@ -515,39 +738,84 @@ class MIBController (proxy.MIBProxyObject):
 		(min, max, start, end) = struct.unpack('IIII', res['buffer'])
 		return (min,max,start,end)
 
+	@return_type('string')
+	def get_report_interval(self):
+		intervals = {4: '10 minutes', 5: '1 hour', 6: '1 day'}
+
+		res = self.rpc(60, 0x04, result_type=(1,False))
+		interval = res['ints'][0]
+
+		if interval not in intervals:
+			raise HardwareError("Unknown interval number in momo", interval=interval, known_intervals=intervals.keys())
+
+		return intervals[interval]
+
+	@param("interval", "string", desc="reporting interval")
+	def set_report_interval(self, interval):
+		"""
+		Set the interval between automatic reports
+
+		Interval should be passed as a string with valid options being:
+		10 minutes
+		1 hour
+		1 day
+		"""
+
+		intervals = {'10 minutes': 4, '1 hour': 5, '1 day': 6}
+
+		interval = interval.lower()
+
+		if interval not in intervals:
+			raise ValidationError("Unknown interval string", interval=interval, known_intervals=intervals.keys())
+
+		intnumber = intervals[interval]
+
+		self.rpc(60, 3, intnumber)
+
+		value = self.get_report_interval()
+		assert value == interval
+
+	@annotated
 	def start_reporting(self):
 		"""
 		Start regular reporting
 		"""
 		self.rpc(60, 1)
 
+	@annotated
 	def stop_reporting(self):
 		"""
 		Stop regular reporting
 		"""
 		self.rpc(60, 2)
 
-	def get_reporting(self):
+	@return_type("bool")
+	def reporting_state(self):
 		"""
-		Get regular reporting state
+		Get whether automatic reporting is enabled
 		"""
-		res = self.rpc(60,14, result_type=(1, True))
+
+		res = self.rpc(60, 14, result_type=(1, True))
 		enabled = bool(res['ints'][0])
 		return enabled
 
+	@annotated
 	def reset_reporting_config(self):
 		"""
 		Reset the reporting configuration.
 		"""
 		res = self.rpc(60,0x12)
 
-	def send_report(self):
+	@annotated
+	def post_single_report(self):
 		"""
 		Send a single report
 		"""
 
 		self.rpc(60, 0)
 
+	@param("index", "integer", desc="0 for primary route, 1 for secondary route")
+	@param("route", "string", desc="URL or phone number to stream data to")
 	def set_report_route(self, index, route):
 		if len(route) == 0:
 			arg = struct.unpack('H', struct.pack('BB', 0, int(index)))
@@ -558,6 +826,8 @@ class MIBController (proxy.MIBProxyObject):
 				arg = struct.unpack('H', struct.pack('BB', int(i), int(index)))
 				self.rpc(60, 5, arg[0], buf)
 
+	@param("index", "integer", desc="0 for primary route, 1 for secondary route")
+	@return_type("string")
 	def get_report_route(self, index):
 		route = ""
 		i = 0
@@ -570,10 +840,12 @@ class MIBController (proxy.MIBProxyObject):
 			route += res['buffer']
 		return route
 
+	@return_type("string")
 	def get_gprs_apn(self):
 		res = self.rpc(60, 0x14, result_type=(0,True))
 		return res['buffer']
 
+	@param("apn", "string", desc='APN for gsm data connections')
 	def set_gprs_apn(self, apn):
 		res = self.rpc(60, 0x13, apn)
 
@@ -604,9 +876,10 @@ class MIBController (proxy.MIBProxyObject):
 		Set the time on the momo controller to the current system time.
 		"""
 
-		now = datetime.now()
-		self.set_time( now.date().year - 2000, now.date().month, now.date().day, now.time().hour, now.time().minute, now.time().second, now.weekday() )
-		print now
+		#Module time should be in UTC so there is uniformity on the server side
+		now = datetime.utcnow()
+		self.set_time(now.date().year - 2000, now.date().month, now.date().day, now.time().hour, now.time().minute, now.time().second, now.weekday())
+		print "Assigned UTC Time:", now
 
 	@annotated
 	def build_report(self):
@@ -641,11 +914,11 @@ class MIBController (proxy.MIBProxyObject):
 		"""
 
 		if type is not None:
-			if not typedargs.is_known_type(type):
+			if not typedargs.type_system.is_known_type(type):
 				raise ArgumentError("unknown type specified", type=type)
 
 			if size == 0:
-				size = typedargs.get_type_size(type)
+				size = typedargs.type_system.get_type_size(type)
 
 		if size == 0:
 			raise ArgumentError("size not specified and could not be determined from supplied type info", supplied_size=size, supplied_type=type)
@@ -661,10 +934,11 @@ class MIBController (proxy.MIBProxyObject):
 			raise InternalError("Read size does not match specified size, this should not happen", read_size=len(buf), specified_size=size)
 		
 		if type is not None:
-			return typedargs.convert_to_type(buf, type)
+			return typedargs.type_system.convert_to_type(buf, type)
 
 		return buf
 
+	@return_type("integer")
 	def scheduler_map(self):
 		"""
 		Get the map of used scheduler buckets
@@ -688,6 +962,7 @@ class MIBController (proxy.MIBProxyObject):
 
 		res = self.rpc(43, 1, int(address), ( (int(feature)<<8) | (int(command)&0xFF) ), int(frequency) );
 
+	@return_type('map(string, integer)')
 	def scheduler_describe(self, index):
 		"""
 		Describe a scheduled callback
@@ -708,9 +983,8 @@ class MIBController (proxy.MIBProxyObject):
 
 		try:
 			self.rpc(42, 0xF)
-		except RPCException as e:
-			if e.type != 7:
-				raise e
+		except ModuleNotFoundError:
+			pass
 
 		if sync:
 			sleep(1.5)
