@@ -41,7 +41,7 @@ setup(
         "decorator==3.4.0",
         "Markdown==2.5.2",
         "nose==1.3.4",
-        "py==1.4.26",
+        "py==1.10.0",
         "pycparser==2.10",
         "pyparsing==2.0.3",
         "pyserial==2.7",
